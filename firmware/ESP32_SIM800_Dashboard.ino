@@ -318,11 +318,24 @@ bool sendTelemetry(const LocationData& loc, const TowerData& cell) {
 
   Serial.println("  [HTTP] Payload: " + json);
 
+  // *** FIX for error 603 (DNS fail on HTTP bearer) ***
+  // The SAPBR bearer is closed after LBS. The HTTP stack uses this
+  // same bearer (CID=1). Re-open it here with DNS before HTTPINIT.
+  sendAT("AT+SAPBR=0,1", 1000);          // Close any stale state
+  safeDelay(500);
+  sendAT("AT+SAPBR=3,1,\"Contype\",\"GPRS\"", 1000);
+  sendAT("AT+SAPBR=3,1,\"APN\",\"" CELL_APN "\"", 1000);
+  sendAT("AT+SAPBR=3,1,\"DNS1\",\"8.8.8.8\"", 1000);  // ← fixes 603
+  sendAT("AT+SAPBR=3,1,\"DNS2\",\"8.8.4.4\"", 1000);
+  String bearerResp = sendAT("AT+SAPBR=1,1", 8000);   // Open bearer
+  safeDelay(2000);
+  String bearerStatus = sendAT("AT+SAPBR=2,1", 2000);
+  Serial.println("  [HTTP] Bearer: " + bearerStatus);
+
   sendAT("AT+HTTPTERM", 1000);
   sendAT("AT+HTTPINIT", 2000);
   sendAT("AT+HTTPPARA=\"CID\",1", 1000);
 
-  // *** HTTPS for Render.com (forces SSL) ***
 #if USE_HTTPS
   sendAT("AT+HTTPSSL=1", 1000);
   String urlCmd = "AT+HTTPPARA=\"URL\",\"https://" + String(SERVER_HOST) + String(SERVER_PATH) + "\"";
