@@ -24,7 +24,8 @@
 
 #define CELL_APN      "bsnlgprs"
 #define SERVER_HOST   "dev-server-2.onrender.com"
-#define SERVER_PORT   80
+#define SERVER_PORT   443
+#define USE_HTTPS     1
 #define SERVER_PATH   "/api/telemetry"
 #define DEVICE_ID     "ESP32C3_SIM800L_TRACKER"
 #define UPDATE_INTERVAL_SEC 15
@@ -177,8 +178,8 @@ int scanCellTowers(TowerData towers[], int maxTowers) {
         td.mnc   = (tokIdx >= 6) ? (uint16_t)tokens[5].toInt() : 0;
         td.lac   = (tokIdx >= 7) ? (uint16_t)strtoul(tokens[6].c_str(), NULL, 16) : 0;
 
-        // Skip empty/invalid neighbor entries
-        if (td.cid == 0 && td.mcc == 0) {
+        // Skip empty/invalid neighbor entries (CID=0xFFFF = no tower)
+        if (td.cid == 0 || td.cid == 0xFFFF || td.mcc == 0) {
           pos = lineEnd + 1;
           continue;
         }
@@ -292,22 +293,36 @@ bool sendTelemetry(const LocationData& loc, const TowerData& cell) {
   sendAT("AT+HTTPINIT", 2000);
   sendAT("AT+HTTPPARA=\"CID\",1", 1000);
 
+  // *** HTTPS for Render.com (forces SSL) ***
+#if USE_HTTPS
+  sendAT("AT+HTTPSSL=1", 1000);
+  String urlCmd = "AT+HTTPPARA=\"URL\",\"https://" + String(SERVER_HOST) + String(SERVER_PATH) + "\"";
+#else
   String urlCmd = "AT+HTTPPARA=\"URL\",\"http://" + String(SERVER_HOST) + ":" + String(SERVER_PORT) + String(SERVER_PATH) + "\"";
+#endif
   sendAT(urlCmd, 1000);
+  Serial.println("  [HTTP] URL: " + urlCmd);
   sendAT("AT+HTTPPARA=\"CONTENT\",\"application/json\"", 1000);
 
   String dataResp = sendAT("AT+HTTPDATA=" + String(json.length()) + ",10000", 2000);
+  Serial.println("  [HTTP] HTTPDATA resp: " + dataResp);
 
   if (dataResp.indexOf("DOWNLOAD") != -1) {
     simSerial.print(json);
-    safeDelay(500);
+    safeDelay(1000);
   }
 
-  String actionResp = sendAT("AT+HTTPACTION=1", 8000);
+  String actionResp = sendAT("AT+HTTPACTION=1", 15000);
+  Serial.println("  [HTTP] ACTION resp: " + actionResp);
   bool ok = (actionResp.indexOf("+HTTPACTION: 1,200") != -1 || actionResp.indexOf(",20") != -1);
 
+  // Read response body for debug
+  if (ok) {
+    String readResp = sendAT("AT+HTTPREAD", 3000);
+    Serial.println("  [HTTP] Server response: " + readResp);
+  }
+
   sendAT("AT+HTTPTERM", 1000);
-  // Close bearer after HTTP
   sendAT("AT+SAPBR=0,1", 1000);
   return ok;
 }
