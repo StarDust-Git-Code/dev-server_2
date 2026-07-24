@@ -53,8 +53,8 @@ function RecenterMap({ center }) {
 }
 
 export default function App() {
-  const [backendUrl, setBackendUrl] = useState('http://localhost:3000');
-  const [inputUrl, setInputUrl] = useState('http://localhost:3000');
+  const [backendUrl, setBackendUrl] = useState('https://dev-server-2.onrender.com');
+  const [inputUrl, setInputUrl] = useState('https://dev-server-2.onrender.com');
   
   // Real device state - NO MOCK DATA
   const [location, setLocation] = useState(null);
