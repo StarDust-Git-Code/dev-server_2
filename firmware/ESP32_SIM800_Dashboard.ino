@@ -23,8 +23,8 @@
 #define STATUS_LED    8
 
 #define CELL_APN      "bsnlgprs"
-#define SERVER_HOST   "192.168.1.100"
-#define SERVER_PORT   3000
+#define SERVER_HOST   "dev-server-2.onrender.com"
+#define SERVER_PORT   80
 #define SERVER_PATH   "/api/telemetry"
 #define DEVICE_ID     "ESP32C3_SIM800L_TRACKER"
 #define UPDATE_INTERVAL_SEC 15
