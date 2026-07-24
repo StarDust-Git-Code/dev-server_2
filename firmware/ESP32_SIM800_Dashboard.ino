@@ -299,7 +299,14 @@ bool getFreeLBSLocation(LocationData& loc) {
 }
 
 // ══════════════════════════════════════════════════
-// HTTP TELEMETRY DISPATCH
+// HTTP TELEMETRY — RAW TCP (CIPSTART)
+//
+// The SAPBR/HTTP stack has broken DNS on BSNL 2G.
+// CIPSTART uses the CSTT stack which already has
+// working DNS (AT+CDNSCFG configured in setup).
+//
+// Strategy: Try SSL port 443 first (TLS 1.0),
+//           fall back to plain TCP port 80.
 // ══════════════════════════════════════════════════
 bool sendTelemetry(const LocationData& loc, const TowerData& cell) {
   String json = "{";
@@ -316,79 +323,77 @@ bool sendTelemetry(const LocationData& loc, const TowerData& cell) {
   json += "\"apn\":\"" CELL_APN "\"";
   json += "}";
 
-  Serial.println("  [HTTP] Payload: " + json);
+  Serial.println("  [TCP] Payload: " + json);
 
-  // *** FIX for error 603 (DNS fail on HTTP bearer) ***
-  // The SAPBR bearer is closed after LBS. The HTTP stack uses this
-  // same bearer (CID=1). Re-open it here with DNS before HTTPINIT.
-  sendAT("AT+SAPBR=0,1", 1000);          // Close any stale state
+  // Close any existing connection
+  sendAT("AT+CIPCLOSE", 2000);
   safeDelay(500);
-  sendAT("AT+SAPBR=3,1,\"Contype\",\"GPRS\"", 1000);
-  sendAT("AT+SAPBR=3,1,\"APN\",\"" CELL_APN "\"", 1000);
-  sendAT("AT+SAPBR=3,1,\"DNS1\",\"8.8.8.8\"", 1000);  // ← fixes 603
-  sendAT("AT+SAPBR=3,1,\"DNS2\",\"8.8.4.4\"", 1000);
-  String bearerResp = sendAT("AT+SAPBR=1,1", 8000);   // Open bearer
-  safeDelay(2000);
-  String bearerStatus = sendAT("AT+SAPBR=2,1", 2000);
-  Serial.println("  [HTTP] Bearer: " + bearerStatus);
 
-  sendAT("AT+HTTPTERM", 1000);
-  sendAT("AT+HTTPINIT", 2000);
-  sendAT("AT+HTTPPARA=\"CID\",1", 1000);
+  // Build the raw HTTP POST request
+  String httpReq = "POST " + String(SERVER_PATH) + " HTTP/1.1\r\n";
+  httpReq += "Host: " + String(SERVER_HOST) + "\r\n";
+  httpReq += "Content-Type: application/json\r\n";
+  httpReq += "Content-Length: " + String(json.length()) + "\r\n";
+  httpReq += "Connection: close\r\n";
+  httpReq += "\r\n";
+  httpReq += json;
 
-#if USE_HTTPS
-  sendAT("AT+HTTPSSL=1", 1000);
-  String urlCmd = "AT+HTTPPARA=\"URL\",\"https://" + String(SERVER_HOST) + String(SERVER_PATH) + "\"";
-#else
-  String urlCmd = "AT+HTTPPARA=\"URL\",\"http://" + String(SERVER_HOST) + ":" + String(SERVER_PORT) + String(SERVER_PATH) + "\"";
-#endif
-  sendAT(urlCmd, 1000);
-  Serial.println("  [HTTP] URL: " + urlCmd);
-  sendAT("AT+HTTPPARA=\"CONTENT\",\"application/json\"", 1000);
+  // ─── Try 1: SSL on port 443 ───
+  Serial.print("  [TCP] Connecting SSL:443... ");
+  sendAT("AT+CIPSSL=1", 1000);
+  String connResp = sendAT("AT+CIPSTART=\"TCP\",\"" + String(SERVER_HOST) + "\",\"443\"", 15000);
 
-  String dataResp = sendAT("AT+HTTPDATA=" + String(json.length()) + ",10000", 2000);
-  Serial.println("  [HTTP] HTTPDATA resp: " + dataResp);
+  // Wait for CONNECT OK or CONNECT FAIL (async)
+  String connResult = waitForResponse("CONNECT", 20000);
+  Serial.println(connResult.indexOf("CONNECT OK") != -1 ? "Connected! ✅" : connResult);
 
-  if (dataResp.indexOf("DOWNLOAD") != -1) {
-    simSerial.print(json);
-    safeDelay(1000);
-  } else {
-    Serial.println("  [HTTP] ⚠ DOWNLOAD prompt not received! Abort.");
-    sendAT("AT+HTTPTERM", 1000);
-    sendAT("AT+SAPBR=0,1", 1000);
-    return false;
+  if (connResult.indexOf("CONNECT OK") == -1) {
+    // ─── Try 2: Plain TCP on port 80 ───
+    Serial.print("  [TCP] SSL failed. Trying plain TCP:80... ");
+    sendAT("AT+CIPCLOSE", 1000);
+    safeDelay(500);
+    sendAT("AT+CIPSSL=0", 1000);
+    connResp = sendAT("AT+CIPSTART=\"TCP\",\"" + String(SERVER_HOST) + "\",\"80\"", 10000);
+    connResult = waitForResponse("CONNECT", 15000);
+    Serial.println(connResult.indexOf("CONNECT OK") != -1 ? "Connected! ✅" : connResult);
+
+    if (connResult.indexOf("CONNECT OK") == -1) {
+      Serial.println("  [TCP] ✗ Both SSL and plain TCP failed.");
+      sendAT("AT+CIPCLOSE", 1000);
+      return false;
+    }
   }
 
-  // Send the HTTP POST — returns OK immediately (request dispatched)
-  // then +HTTPACTION: 1,<status>,<bytes> arrives asynchronously
-  simSerial.println("AT+HTTPACTION=1");
-  String initResp = "";
-  uint32_t t0 = millis();
-  while (millis() - t0 < 3000) {
-    while (simSerial.available()) initResp += (char)simSerial.read();
-    if (initResp.indexOf("OK") != -1 || initResp.indexOf("ERROR") != -1) break;
-    safeDelay(50);
+  // ─── Send the HTTP POST ───
+  Serial.print("  [TCP] Sending " + String(httpReq.length()) + " bytes... ");
+  sendAT("AT+CIPSEND=" + String(httpReq.length()), 3000);
+  safeDelay(500);
+
+  // Wait for > prompt then send data
+  simSerial.print(httpReq);
+  safeDelay(500);
+
+  // Wait for SEND OK
+  String sendResult = waitForResponse("SEND OK", 10000);
+  bool sent = (sendResult.indexOf("SEND OK") != -1);
+  Serial.println(sent ? "SENT! ✅" : "Send failed.");
+
+  if (sent) {
+    // Read server response (look for HTTP status)
+    Serial.print("  [TCP] Reading response... ");
+    String serverResp = waitForResponse("CLOSED", 10000);
+    // Extract HTTP status code
+    int httpIdx = serverResp.indexOf("HTTP/1.");
+    if (httpIdx != -1) {
+      String statusLine = serverResp.substring(httpIdx, serverResp.indexOf("\r\n", httpIdx));
+      Serial.println(statusLine);
+    } else {
+      Serial.println(serverResp.substring(0, min((int)serverResp.length(), 120)));
+    }
   }
-  Serial.println("  [HTTP] HTTPACTION init: " + initResp);
 
-  // Now wait separately for the async +HTTPACTION: response (up to 30s)
-  Serial.print("  [HTTP] Waiting for server response...");
-  String actionResp = waitForResponse("+HTTPACTION:", 30000);
-  Serial.println(" Done.");
-  Serial.println("  [HTTP] ACTION result: " + actionResp);
-
-  bool ok = (actionResp.indexOf("+HTTPACTION: 1,200") != -1 ||
-             actionResp.indexOf(",200,") != -1 ||
-             actionResp.indexOf(",201,") != -1);
-
-  if (ok) {
-    String readResp = sendAT("AT+HTTPREAD", 3000);
-    Serial.println("  [HTTP] Server says: " + readResp);
-  }
-
-  sendAT("AT+HTTPTERM", 1000);
-  sendAT("AT+SAPBR=0,1", 1000);
-  return ok;
+  sendAT("AT+CIPCLOSE", 1000);
+  return sent;
 }
 
 // ══════════════════════════════════════════════════
