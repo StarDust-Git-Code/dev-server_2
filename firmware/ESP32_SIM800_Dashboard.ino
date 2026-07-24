@@ -23,9 +23,14 @@
 #define STATUS_LED    8
 
 #define CELL_APN      "bsnlgprs"
+// Render forces TLS 1.2 — SIM800L only supports TLS 1.0 → HTTPS fails.
+// Workaround: use port 80 HTTP. Render redirects HTTP→HTTPS at the edge,
+// but the SIM800L TCP connection itself reaches the HTTP port fine because
+// Render terminates SSL at their load balancer and forwards plain HTTP internally.
+// If still failing, switch SERVER_HOST to a plain HTTP relay (see comments).
 #define SERVER_HOST   "dev-server-2.onrender.com"
-#define SERVER_PORT   443
-#define USE_HTTPS     1
+#define SERVER_PORT   80
+#define USE_HTTPS     0
 #define SERVER_PATH   "/api/telemetry"
 #define DEVICE_ID     "ESP32C3_SIM800L_TRACKER"
 #define UPDATE_INTERVAL_SEC 15
@@ -85,6 +90,30 @@ String sendAT(const String& cmd, uint32_t timeoutMs = 3000) {
     safeDelay(50);
   }
   return response;
+}
+
+// ══════════════════════════════════════════════════
+// ASYNC AT WAIT — for commands that return OK first,
+// then send the real result asynchronously.
+// Example: AT+HTTPACTION=1 → "OK" (immediate)
+//          → "+HTTPACTION: 1,200,xx" (arrives later)
+// ══════════════════════════════════════════════════
+String waitForResponse(const String& waitFor, uint32_t timeoutMs = 20000) {
+  String response = "";
+  uint32_t start = millis();
+
+  while (millis() - start < timeoutMs) {
+    while (simSerial.available()) {
+      response += (char)simSerial.read();
+    }
+    if (response.indexOf(waitFor) != -1) {
+      safeDelay(50);
+      while (simSerial.available()) response += (char)simSerial.read();
+      return response;
+    }
+    safeDelay(50);
+  }
+  return response; // Return whatever we got (timeout)
 }
 
 // ══════════════════════════════════════════════════
@@ -310,16 +339,38 @@ bool sendTelemetry(const LocationData& loc, const TowerData& cell) {
   if (dataResp.indexOf("DOWNLOAD") != -1) {
     simSerial.print(json);
     safeDelay(1000);
+  } else {
+    Serial.println("  [HTTP] ⚠ DOWNLOAD prompt not received! Abort.");
+    sendAT("AT+HTTPTERM", 1000);
+    sendAT("AT+SAPBR=0,1", 1000);
+    return false;
   }
 
-  String actionResp = sendAT("AT+HTTPACTION=1", 15000);
-  Serial.println("  [HTTP] ACTION resp: " + actionResp);
-  bool ok = (actionResp.indexOf("+HTTPACTION: 1,200") != -1 || actionResp.indexOf(",20") != -1);
+  // Send the HTTP POST — returns OK immediately (request dispatched)
+  // then +HTTPACTION: 1,<status>,<bytes> arrives asynchronously
+  simSerial.println("AT+HTTPACTION=1");
+  String initResp = "";
+  uint32_t t0 = millis();
+  while (millis() - t0 < 3000) {
+    while (simSerial.available()) initResp += (char)simSerial.read();
+    if (initResp.indexOf("OK") != -1 || initResp.indexOf("ERROR") != -1) break;
+    safeDelay(50);
+  }
+  Serial.println("  [HTTP] HTTPACTION init: " + initResp);
 
-  // Read response body for debug
+  // Now wait separately for the async +HTTPACTION: response (up to 30s)
+  Serial.print("  [HTTP] Waiting for server response...");
+  String actionResp = waitForResponse("+HTTPACTION:", 30000);
+  Serial.println(" Done.");
+  Serial.println("  [HTTP] ACTION result: " + actionResp);
+
+  bool ok = (actionResp.indexOf("+HTTPACTION: 1,200") != -1 ||
+             actionResp.indexOf(",200,") != -1 ||
+             actionResp.indexOf(",201,") != -1);
+
   if (ok) {
     String readResp = sendAT("AT+HTTPREAD", 3000);
-    Serial.println("  [HTTP] Server response: " + readResp);
+    Serial.println("  [HTTP] Server says: " + readResp);
   }
 
   sendAT("AT+HTTPTERM", 1000);
