@@ -299,15 +299,50 @@ bool getFreeLBSLocation(LocationData& loc) {
 }
 
 // ══════════════════════════════════════════════════
-// HTTP TELEMETRY — RAW TCP (CIPSTART)
+// HTTP TELEMETRY — SAPBR/HTTP with DNS BYPASS
 //
-// The SAPBR/HTTP stack has broken DNS on BSNL 2G.
-// CIPSTART uses the CSTT stack which already has
-// working DNS (AT+CDNSCFG configured in setup).
-//
-// Strategy: Try SSL port 443 first (TLS 1.0),
-//           fall back to plain TCP port 80.
+// Problem: SAPBR bearer DNS is broken on BSNL 2G.
+// Solution:
+//   1. Resolve hostname → IP using CSTT DNS (AT+CDNSGIP)
+//      (CSTT DNS works — we got an IP in setup)
+//   2. Use the IP in the HTTP URL (no DNS needed on SAPBR)
+//   3. Set Host header via USERDATA (for Cloudflare routing)
+//   4. AT+HTTPSSL=1 does real TLS (unlike CIPSSL which is fake)
 // ══════════════════════════════════════════════════
+String resolvedIP = "";  // Cache resolved IP
+
+String resolveHostname() {
+  if (resolvedIP.length() > 0) return resolvedIP;
+
+  Serial.print("  [DNS] Resolving " SERVER_HOST "... ");
+  // AT+CDNSGIP uses CSTT stack DNS (AT+CDNSCFG) which WORKS
+  String resp = sendAT("AT+CDNSGIP=\"" SERVER_HOST "\"", 10000);
+
+  // Wait for async response: +CDNSGIP: 1,"hostname","ip1"[,"ip2"]
+  if (resp.indexOf("+CDNSGIP:") == -1) {
+    resp += waitForResponse("+CDNSGIP:", 10000);
+  }
+
+  Serial.println(resp);
+
+  int lastQuote = resp.lastIndexOf('"');
+  if (lastQuote < 2) return "";
+
+  // Find the IP (last quoted string)
+  int prevQuote = resp.lastIndexOf('"', lastQuote - 1);
+  if (prevQuote == -1) return "";
+
+  String ip = resp.substring(prevQuote + 1, lastQuote);
+
+  // Validate it looks like an IP
+  if (ip.indexOf('.') != -1 && ip.length() >= 7) {
+    resolvedIP = ip;
+    Serial.println("  [DNS] Resolved → " + resolvedIP);
+    return resolvedIP;
+  }
+  return "";
+}
+
 bool sendTelemetry(const LocationData& loc, const TowerData& cell) {
   String json = "{";
   json += "\"deviceId\":\"" DEVICE_ID "\",";
@@ -323,77 +358,84 @@ bool sendTelemetry(const LocationData& loc, const TowerData& cell) {
   json += "\"apn\":\"" CELL_APN "\"";
   json += "}";
 
-  Serial.println("  [TCP] Payload: " + json);
+  Serial.println("  [HTTP] Payload (" + String(json.length()) + " bytes)");
 
-  // Close any existing connection
-  sendAT("AT+CIPCLOSE", 2000);
+  // ── Step 1: Resolve hostname to IP via CSTT DNS ──
+  String ip = resolveHostname();
+  if (ip.length() == 0) {
+    Serial.println("  [HTTP] ✗ DNS resolution failed. Skip.");
+    return false;
+  }
+
+  // ── Step 2: Open SAPBR bearer (NO custom DNS — not needed!) ──
+  sendAT("AT+SAPBR=0,1", 1000);
   safeDelay(500);
+  sendAT("AT+SAPBR=3,1,\"Contype\",\"GPRS\"", 1000);
+  sendAT("AT+SAPBR=3,1,\"APN\",\"" CELL_APN "\"", 1000);
+  // NO DNS1/DNS2 — we bypass DNS entirely by using IP!
+  String openResp = sendAT("AT+SAPBR=1,1", 10000);
+  safeDelay(2000);
+  String statusResp = sendAT("AT+SAPBR=2,1", 2000);
+  Serial.println("  [HTTP] Bearer: " + statusResp);
 
-  // Build the raw HTTP POST request
-  String httpReq = "POST " + String(SERVER_PATH) + " HTTP/1.1\r\n";
-  httpReq += "Host: " + String(SERVER_HOST) + "\r\n";
-  httpReq += "Content-Type: application/json\r\n";
-  httpReq += "Content-Length: " + String(json.length()) + "\r\n";
-  httpReq += "Connection: close\r\n";
-  httpReq += "\r\n";
-  httpReq += json;
+  // ── Step 3: HTTP POST to IP with real TLS ──
+  sendAT("AT+HTTPTERM", 1000);
+  sendAT("AT+HTTPINIT", 2000);
+  sendAT("AT+HTTPPARA=\"CID\",1", 1000);
+  sendAT("AT+HTTPSSL=1", 1000);  // Real TLS (not CIPSSL fake)
 
-  // ─── Try 1: SSL on port 443 ───
-  Serial.print("  [TCP] Connecting SSL:443... ");
-  sendAT("AT+CIPSSL=1", 1000);
-  String connResp = sendAT("AT+CIPSTART=\"TCP\",\"" + String(SERVER_HOST) + "\",\"443\"", 15000);
+  // URL uses resolved IP → no SAPBR DNS needed!
+  String url = "https://" + ip + String(SERVER_PATH);
+  sendAT("AT+HTTPPARA=\"URL\",\"" + url + "\"", 1000);
+  Serial.println("  [HTTP] URL: " + url);
 
-  // Wait for CONNECT OK or CONNECT FAIL (async)
-  String connResult = waitForResponse("CONNECT", 20000);
-  Serial.println(connResult.indexOf("CONNECT OK") != -1 ? "Connected! ✅" : connResult);
+  // Host header for Cloudflare routing (critical!)
+  sendAT("AT+HTTPPARA=\"USERDATA\",\"Host: " SERVER_HOST "\"", 1000);
+  sendAT("AT+HTTPPARA=\"CONTENT\",\"application/json\"", 1000);
 
-  if (connResult.indexOf("CONNECT OK") == -1) {
-    // ─── Try 2: Plain TCP on port 80 ───
-    Serial.print("  [TCP] SSL failed. Trying plain TCP:80... ");
-    sendAT("AT+CIPCLOSE", 1000);
-    safeDelay(500);
-    sendAT("AT+CIPSSL=0", 1000);
-    connResp = sendAT("AT+CIPSTART=\"TCP\",\"" + String(SERVER_HOST) + "\",\"80\"", 10000);
-    connResult = waitForResponse("CONNECT", 15000);
-    Serial.println(connResult.indexOf("CONNECT OK") != -1 ? "Connected! ✅" : connResult);
+  // ── Step 4: Send data ──
+  String dataResp = sendAT("AT+HTTPDATA=" + String(json.length()) + ",10000", 2000);
+  if (dataResp.indexOf("DOWNLOAD") == -1) {
+    Serial.println("  [HTTP] ✗ DOWNLOAD prompt missing. Abort.");
+    sendAT("AT+HTTPTERM", 1000);
+    sendAT("AT+SAPBR=0,1", 1000);
+    return false;
+  }
+  simSerial.print(json);
+  safeDelay(1000);
 
-    if (connResult.indexOf("CONNECT OK") == -1) {
-      Serial.println("  [TCP] ✗ Both SSL and plain TCP failed.");
-      sendAT("AT+CIPCLOSE", 1000);
-      return false;
+  // ── Step 5: Execute POST (async response) ──
+  simSerial.println("AT+HTTPACTION=1");
+  String initResp = "";
+  uint32_t t0 = millis();
+  while (millis() - t0 < 3000) {
+    while (simSerial.available()) initResp += (char)simSerial.read();
+    if (initResp.indexOf("OK") != -1 || initResp.indexOf("ERROR") != -1) break;
+    safeDelay(50);
+  }
+
+  Serial.print("  [HTTP] Waiting for response...");
+  String actionResp = waitForResponse("+HTTPACTION:", 30000);
+  Serial.println(" Done.");
+  Serial.println("  [HTTP] Result: " + actionResp);
+
+  bool ok = (actionResp.indexOf(",200,") != -1 || actionResp.indexOf(",201,") != -1);
+
+  if (ok) {
+    String body = sendAT("AT+HTTPREAD", 3000);
+    Serial.println("  [HTTP] ✅ Server: " + body);
+  } else {
+    // Extract error code for debugging
+    int codeStart = actionResp.indexOf(",") + 1;
+    int codeEnd = actionResp.indexOf(",", codeStart);
+    if (codeStart > 0 && codeEnd > codeStart) {
+      Serial.println("  [HTTP] Status: " + actionResp.substring(codeStart, codeEnd));
     }
   }
 
-  // ─── Send the HTTP POST ───
-  Serial.print("  [TCP] Sending " + String(httpReq.length()) + " bytes... ");
-  sendAT("AT+CIPSEND=" + String(httpReq.length()), 3000);
-  safeDelay(500);
-
-  // Wait for > prompt then send data
-  simSerial.print(httpReq);
-  safeDelay(500);
-
-  // Wait for SEND OK
-  String sendResult = waitForResponse("SEND OK", 10000);
-  bool sent = (sendResult.indexOf("SEND OK") != -1);
-  Serial.println(sent ? "SENT! ✅" : "Send failed.");
-
-  if (sent) {
-    // Read server response (look for HTTP status)
-    Serial.print("  [TCP] Reading response... ");
-    String serverResp = waitForResponse("CLOSED", 10000);
-    // Extract HTTP status code
-    int httpIdx = serverResp.indexOf("HTTP/1.");
-    if (httpIdx != -1) {
-      String statusLine = serverResp.substring(httpIdx, serverResp.indexOf("\r\n", httpIdx));
-      Serial.println(statusLine);
-    } else {
-      Serial.println(serverResp.substring(0, min((int)serverResp.length(), 120)));
-    }
-  }
-
-  sendAT("AT+CIPCLOSE", 1000);
-  return sent;
+  sendAT("AT+HTTPTERM", 1000);
+  sendAT("AT+SAPBR=0,1", 1000);
+  return ok;
 }
 
 // ══════════════════════════════════════════════════
