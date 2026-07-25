@@ -140,10 +140,30 @@ function lookupCell(mcc, mnc, lac, cid, rssi) {
   });
 }
 
+// ── Single cell OpenCellID lookup (for triangulation) ─────────
+function lookupSingleCell(mcc, mnc, lac, cid) {
+  return new Promise((resolve) => {
+    if (!OPENCELLID_KEY) { resolve({}); return; }
+    const url = `https://opencellid.org/cell/get?key=${OPENCELLID_KEY}&mcc=${mcc}&mnc=${mnc}&lac=${lac}&cellid=${cid}&format=json`;
+    https.get(url, (res) => {
+      let raw = '';
+      res.on('data', c => raw += c);
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(raw);
+          if (j.lat && j.lon) {
+            resolve({ lat: parseFloat(j.lat), lon: parseFloat(j.lon), range: parseFloat(j.range || 500) });
+          } else { resolve({}); }
+        } catch (_) { resolve({}); }
+      });
+    }).on('error', () => resolve({}));
+  });
+}
+
 // ── Blynk Polling ─────────────────────────────────────────────
 async function pollBlynk() {
   return new Promise((resolve) => {
-    const url = `https://${BLYNK_HOST}/external/api/get?token=${BLYNK_TOKEN}&v1&v2&v3&v4&v5`;
+    const url = `https://${BLYNK_HOST}/external/api/get?token=${BLYNK_TOKEN}&v1&v2&v3&v4&v5&v6`;
 
     https.get(url, (res) => {
       let raw = '';
@@ -156,6 +176,7 @@ async function pollBlynk() {
           const lac  = parseInt(data.v3 || 0);
           const cid  = parseInt(data.v4 || 0);
           const rssi = parseInt(data.v5 || -85);
+          const neighborsStr = data.v6 || '';
 
           // Skip if no valid cell data
           if (mcc === 0 || cid === 0) { resolve(false); return; }
@@ -163,38 +184,90 @@ async function pollBlynk() {
           // Skip if same as last known (no change)
           if (mcc === lastKnownCell.mcc && mnc === lastKnownCell.mnc &&
               lac === lastKnownCell.lac && cid === lastKnownCell.cid &&
-              rssi === lastKnownCell.rssi) {
+              rssi === lastKnownCell.rssi && neighborsStr === lastKnownCell.neighbors) {
             resolve(false);
             return;
           }
 
-          // New cell data!
-          lastKnownCell = { mcc, mnc, lac, cid, rssi };
-          console.log(`[BLYNK] New cell: MCC=${mcc} MNC=${mnc} LAC=${lac} CID=${cid} RSSI=${rssi}`);
+          lastKnownCell = { mcc, mnc, lac, cid, rssi, neighbors: neighborsStr };
 
-          // Try OpenCellID lookup
-          const geo = await lookupCell(mcc, mnc, lac, cid, rssi);
+          // Parse ALL towers from V6: "CID:RSSI,CID:RSSI,..."
+          const allTowers = [];
+          if (neighborsStr) {
+            const pairs = neighborsStr.split(',');
+            for (const pair of pairs) {
+              const [cidStr, rssiStr] = pair.split(':');
+              const c = parseInt(cidStr);
+              const r = parseInt(rssiStr);
+              if (c > 0 && c !== 0xFFFF && !isNaN(r)) {
+                allTowers.push({ cid: c, rssi: r });
+              }
+            }
+          }
+          // Fallback: if V6 empty, use serving cell only
+          if (allTowers.length === 0) {
+            allTowers.push({ cid, rssi });
+          }
+
+          console.log(`[BLYNK] ${allTowers.length} tower(s): ${allTowers.map(t => `CID:${t.cid}(${t.rssi}dBm)`).join(' ')}`);
+
+          // ── TRIANGULATION: look up ALL towers, compute weighted centroid ──
+          const towerCoords = [];
+          for (const tower of allTowers) {
+            try {
+              const geo = await lookupSingleCell(mcc, mnc, lac, tower.cid);
+              if (geo.lat && geo.lon) {
+                // RSSI to linear weight: stronger signal (less negative) = higher weight
+                // w = 10^(rssi/10) — but normalized to avoid tiny numbers
+                const weight = Math.pow(10, (tower.rssi + 110) / 20);
+                towerCoords.push({ lat: geo.lat, lon: geo.lon, weight, cid: tower.cid, rssi: tower.rssi, range: geo.range });
+                console.log(`  [OCID] CID:${tower.cid} → ${geo.lat.toFixed(5)},${geo.lon.toFixed(5)} w=${weight.toFixed(2)}`);
+              }
+            } catch (_) {}
+          }
+
+          let latitude, longitude, accuracy, source;
+
+          if (towerCoords.length >= 2) {
+            // Weighted centroid
+            let totalWeight = 0, wLat = 0, wLon = 0;
+            for (const t of towerCoords) {
+              wLat += t.lat * t.weight;
+              wLon += t.lon * t.weight;
+              totalWeight += t.weight;
+            }
+            latitude  = wLat / totalWeight;
+            longitude = wLon / totalWeight;
+            // Accuracy improves with more towers
+            accuracy = Math.round(500 / Math.sqrt(towerCoords.length));
+            source = `Triangulated (${towerCoords.length} towers)`;
+            console.log(`[TRIANGULATE] ${towerCoords.length} towers → ${latitude.toFixed(5)},${longitude.toFixed(5)} ±${accuracy}m`);
+          } else if (towerCoords.length === 1) {
+            latitude  = towerCoords[0].lat;
+            longitude = towerCoords[0].lon;
+            accuracy  = towerCoords[0].range || 500;
+            source    = 'OpenCellID (single tower)';
+          } else {
+            // Fallback to LAC map
+            const geo = await lookupCell(mcc, mnc, lac, cid, rssi);
+            latitude  = geo.latitude;
+            longitude = geo.longitude;
+            accuracy  = geo.accuracy;
+            source    = geo.source;
+          }
 
           const record = {
             deviceId:  'ESP32C3_SIM800L_TRACKER',
             mcc, mnc, lac, cid, rssi,
+            towersUsed: towerCoords.length,
             arfcn:     0,
             apn:       'bsnlgprs',
-            latitude:  geo.latitude,
-            longitude: geo.longitude,
-            accuracy:  geo.accuracy,
-            source:    geo.source,
+            latitude, longitude, accuracy, source,
             timestamp: new Date().toISOString()
           };
 
           storeRecord(record);
-
-          if (geo.latitude) {
-            console.log(`[OPENCELLID] CID:${cid} → ${geo.latitude},${geo.longitude} ±${geo.accuracy}m`);
-          } else {
-            console.log(`[CELL] CID:${cid} → stored metadata (no coordinates)`);
-          }
-
+          console.log(`[RESULT] ${source}: ${latitude?.toFixed(5)},${longitude?.toFixed(5)} ±${accuracy}m`);
           resolve(true);
         } catch (e) {
           console.warn('[BLYNK] Parse error:', e.message);

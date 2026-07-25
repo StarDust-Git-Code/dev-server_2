@@ -190,8 +190,9 @@ String ensureGPRS() {
 // CSTT DNS resolves the hostname (proven to work on BSNL 2G)
 // Sends HTTP GET with all 5 cell values in one request
 // ══════════════════════════════════════════════════════════════
-bool sendToBlynk(const TowerData& cell) {
-  Serial.print("[BLYNK] Sending... ");
+bool sendToBlynk(const TowerData* towers, int count) {
+  if (count == 0) return false;
+  Serial.print("[BLYNK] Sending " + String(count) + " towers... ");
 
   // 1. Ensure GPRS is active
   String gprsIP = ensureGPRS();
@@ -200,14 +201,23 @@ bool sendToBlynk(const TowerData& cell) {
     return false;
   }
 
-  // 2. Build HTTP GET request
-  //    /external/api/batch/update updates ALL pins atomically
+  // 2. Build HTTP GET request with ALL tower data
+  //    V1-V5: serving cell, V6: neighbor CID:RSSI pairs for triangulation
   String path = "/external/api/batch/update?token=" BLYNK_TOKEN;
-  path += "&v1=" + String(cell.mcc);
-  path += "&v2=" + String(cell.mnc);
-  path += "&v3=" + String(cell.lac);
-  path += "&v4=" + String(cell.cid);
-  path += "&v5=" + String(cell.rssi);
+  path += "&v1=" + String(towers[0].mcc);
+  path += "&v2=" + String(towers[0].mnc);
+  path += "&v3=" + String(towers[0].lac);
+  path += "&v4=" + String(towers[0].cid);
+  path += "&v5=" + String(towers[0].rssi);
+
+  // Pack ALL towers (including serving) as CID:RSSI pairs in V6
+  // Format: "33572:-79,33573:-81,33482:-91"
+  String neighbors = "";
+  for (int i = 0; i < count && i < 7; i++) {
+    if (i > 0) neighbors += ",";
+    neighbors += String(towers[i].cid) + ":" + String(towers[i].rssi);
+  }
+  path += "&v6=" + neighbors;
 
   String httpReq = "GET " + path + " HTTP/1.1\r\n";
   httpReq += "Host: " BLYNK_HOST "\r\n";
@@ -367,8 +377,8 @@ void loop() {
       Serial.println("[SCAN] No towers parsed. Using BSNL default.");
     }
 
-    // 2. Send to Blynk
-    bool sent = sendToBlynk(primary);
+    // 2. Send ALL towers to Blynk (for triangulation)
+    bool sent = sendToBlynk(towers, count > 0 ? count : 1);
     if (sent) blinkLED(3, 80);
   }
 
