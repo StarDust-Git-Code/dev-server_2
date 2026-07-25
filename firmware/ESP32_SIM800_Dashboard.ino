@@ -29,7 +29,7 @@
 
 // ── Blynk IoT (plain HTTP bridge) ───────────────────────────
 #define BLYNK_TOKEN       "9fq9knGHB9Txb33Mlv4_O-JrMpOgjtkv"
-#define BLYNK_HOST        "blynk.cloud"
+#define BLYNK_HOST        "blr1.blynk.cloud"
 #define BLYNK_PORT        80
 
 // ── Device ID ───────────────────────────────────────────────
