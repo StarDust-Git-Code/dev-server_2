@@ -299,50 +299,15 @@ bool getFreeLBSLocation(LocationData& loc) {
 }
 
 // ══════════════════════════════════════════════════
-// HTTP TELEMETRY — SAPBR/HTTP with DNS BYPASS
+// HTTP TELEMETRY — Plain HTTP via SAPBR
 //
-// Problem: SAPBR bearer DNS is broken on BSNL 2G.
-// Solution:
-//   1. Resolve hostname → IP using CSTT DNS (AT+CDNSGIP)
-//      (CSTT DNS works — we got an IP in setup)
-//   2. Use the IP in the HTTP URL (no DNS needed on SAPBR)
-//   3. Set Host header via USERDATA (for Cloudflare routing)
-//   4. AT+HTTPSSL=1 does real TLS (unlike CIPSSL which is fake)
+// SAPBR DNS works on BSNL 2G (proved: error was
+// 606 SSL, not 603 DNS). SIM800L TLS 1.0 can't
+// negotiate with Render's TLS 1.2. So: NO SSL.
+//
+// Plain HTTP + REDIR=1 to follow any 301→HTTPS.
+// If Cloudflare rejects, we'll need a plain HTTP relay.
 // ══════════════════════════════════════════════════
-String resolvedIP = "";  // Cache resolved IP
-
-String resolveHostname() {
-  if (resolvedIP.length() > 0) return resolvedIP;
-
-  Serial.print("  [DNS] Resolving " SERVER_HOST "... ");
-  // AT+CDNSGIP uses CSTT stack DNS (AT+CDNSCFG) which WORKS
-  String resp = sendAT("AT+CDNSGIP=\"" SERVER_HOST "\"", 10000);
-
-  // Wait for async response: +CDNSGIP: 1,"hostname","ip1"[,"ip2"]
-  if (resp.indexOf("+CDNSGIP:") == -1) {
-    resp += waitForResponse("+CDNSGIP:", 10000);
-  }
-
-  Serial.println(resp);
-
-  int lastQuote = resp.lastIndexOf('"');
-  if (lastQuote < 2) return "";
-
-  // Find the IP (last quoted string)
-  int prevQuote = resp.lastIndexOf('"', lastQuote - 1);
-  if (prevQuote == -1) return "";
-
-  String ip = resp.substring(prevQuote + 1, lastQuote);
-
-  // Validate it looks like an IP
-  if (ip.indexOf('.') != -1 && ip.length() >= 7) {
-    resolvedIP = ip;
-    Serial.println("  [DNS] Resolved → " + resolvedIP);
-    return resolvedIP;
-  }
-  return "";
-}
-
 bool sendTelemetry(const LocationData& loc, const TowerData& cell) {
   String json = "{";
   json += "\"deviceId\":\"" DEVICE_ID "\",";
@@ -360,60 +325,39 @@ bool sendTelemetry(const LocationData& loc, const TowerData& cell) {
 
   Serial.println("  [HTTP] Payload (" + String(json.length()) + " bytes)");
 
-  // ── Step 0: Ensure GPRS is alive ──
+  // ── Step 1: Ensure GPRS ──
   String liveIP = ensureGPRS();
   if (liveIP.indexOf('.') == -1 || liveIP.indexOf("0.0.0.0") != -1) {
-    Serial.println("  [HTTP] ✗ No GPRS IP. Skip.");
+    Serial.println("  [HTTP] ✗ No GPRS. Skip.");
     return false;
   }
 
-  // ── Step 1: Resolve hostname to IP via CSTT DNS ──
-  // Reset TCP state before DNS to avoid stale state
-  resolvedIP = "";  // force re-resolve on fresh connection
-  sendAT("AT+CIPSHUT", 3000);
-  safeDelay(500);
-  sendAT("AT+CIPMUX=0", 1000);
-  sendAT("AT+CSTT=\"" CELL_APN "\",\"\",\"\"", 1000);
-  sendAT("AT+CIICR", 10000);
-  safeDelay(2000);
-  sendAT("AT+CDNSCFG=\"8.8.8.8\",\"8.8.4.4\"", 1000);
-
-  String ip = resolveHostname();
-  if (ip.length() == 0) {
-    Serial.println("  [HTTP] ✗ DNS resolution failed. Skip.");
-    return false;
-  }
-
-  // ── Step 2: Open SAPBR bearer (NO custom DNS — not needed!) ──
+  // ── Step 2: Open SAPBR bearer ──
   sendAT("AT+SAPBR=0,1", 1000);
-  safeDelay(500);
+  safeDelay(300);
   sendAT("AT+SAPBR=3,1,\"Contype\",\"GPRS\"", 1000);
   sendAT("AT+SAPBR=3,1,\"APN\",\"" CELL_APN "\"", 1000);
-  // NO DNS1/DNS2 — we bypass DNS entirely by using IP!
-  String openResp = sendAT("AT+SAPBR=1,1", 10000);
+  sendAT("AT+SAPBR=1,1", 10000);
   safeDelay(2000);
-  String statusResp = sendAT("AT+SAPBR=2,1", 2000);
-  Serial.println("  [HTTP] Bearer: " + statusResp);
+  String bearerSt = sendAT("AT+SAPBR=2,1", 2000);
+  Serial.println("  [HTTP] Bearer: " + bearerSt);
 
-  // ── Step 3: HTTP POST to IP with real TLS ──
+  // ── Step 3: HTTP POST (plain HTTP, no SSL) ──
   sendAT("AT+HTTPTERM", 1000);
   sendAT("AT+HTTPINIT", 2000);
   sendAT("AT+HTTPPARA=\"CID\",1", 1000);
-  sendAT("AT+HTTPSSL=1", 1000);  // Real TLS (not CIPSSL fake)
+  sendAT("AT+HTTPSSL=0", 1000);  // NO SSL — SIM800L TLS 1.0 fails
+  sendAT("AT+HTTPPARA=\"REDIR\",1", 1000);  // Follow 301 redirects
 
-  // URL uses resolved IP → no SAPBR DNS needed!
-  String url = "https://" + ip + String(SERVER_PATH);
+  String url = "http://" + String(SERVER_HOST) + String(SERVER_PATH);
   sendAT("AT+HTTPPARA=\"URL\",\"" + url + "\"", 1000);
   Serial.println("  [HTTP] URL: " + url);
-
-  // Host header for Cloudflare routing (critical!)
-  sendAT("AT+HTTPPARA=\"USERDATA\",\"Host: " SERVER_HOST "\"", 1000);
   sendAT("AT+HTTPPARA=\"CONTENT\",\"application/json\"", 1000);
 
   // ── Step 4: Send data ──
   String dataResp = sendAT("AT+HTTPDATA=" + String(json.length()) + ",10000", 2000);
   if (dataResp.indexOf("DOWNLOAD") == -1) {
-    Serial.println("  [HTTP] ✗ DOWNLOAD prompt missing. Abort.");
+    Serial.println("  [HTTP] ✗ No DOWNLOAD prompt.");
     sendAT("AT+HTTPTERM", 1000);
     sendAT("AT+SAPBR=0,1", 1000);
     return false;
@@ -421,32 +365,39 @@ bool sendTelemetry(const LocationData& loc, const TowerData& cell) {
   simSerial.print(json);
   safeDelay(1000);
 
-  // ── Step 5: Execute POST (async response) ──
+  // ── Step 5: Execute POST + wait async response ──
   simSerial.println("AT+HTTPACTION=1");
-  String initResp = "";
+  String initR = "";
   uint32_t t0 = millis();
   while (millis() - t0 < 3000) {
-    while (simSerial.available()) initResp += (char)simSerial.read();
-    if (initResp.indexOf("OK") != -1 || initResp.indexOf("ERROR") != -1) break;
+    while (simSerial.available()) initR += (char)simSerial.read();
+    if (initR.indexOf("OK") != -1 || initR.indexOf("ERROR") != -1) break;
     safeDelay(50);
   }
 
-  Serial.print("  [HTTP] Waiting for response...");
+  Serial.print("  [HTTP] Waiting...");
   String actionResp = waitForResponse("+HTTPACTION:", 30000);
   Serial.println(" Done.");
   Serial.println("  [HTTP] Result: " + actionResp);
 
-  bool ok = (actionResp.indexOf(",200,") != -1 || actionResp.indexOf(",201,") != -1);
+  bool ok = (actionResp.indexOf(",200,") != -1 ||
+             actionResp.indexOf(",201,") != -1);
 
   if (ok) {
     String body = sendAT("AT+HTTPREAD", 3000);
     Serial.println("  [HTTP] ✅ Server: " + body);
   } else {
-    // Extract error code for debugging
-    int codeStart = actionResp.indexOf(",") + 1;
-    int codeEnd = actionResp.indexOf(",", codeStart);
-    if (codeStart > 0 && codeEnd > codeStart) {
-      Serial.println("  [HTTP] Status: " + actionResp.substring(codeStart, codeEnd));
+    int cs = actionResp.indexOf(",") + 1;
+    int ce = actionResp.indexOf(",", cs);
+    if (cs > 0 && ce > cs) {
+      String code = actionResp.substring(cs, ce);
+      Serial.println("  [HTTP] Status: " + code);
+      if (code == "301" || code == "302") {
+        Serial.println("  [HTTP] Redirect detected. REDIR=1 should follow it.");
+        // Read redirect URL for debugging
+        String readResp = sendAT("AT+HTTPREAD", 3000);
+        Serial.println("  [HTTP] Redirect body: " + readResp);
+      }
     }
   }
 
@@ -472,7 +423,7 @@ void setup() {
   Serial.println(" ESP32-C3 + SIM800L CELLULAR TRIANGULATION TRACKER");
   Serial.println(" Network: BSNL 2G (PLMN 40464, APN: " CELL_APN ")");
   Serial.println(" Strategy: 100% FREE (LBS + Multi-Cell Scan)");
-  Serial.println(" v10: GPRS reconnect + TCP state reset + signal check");
+  Serial.println(" v11: Plain HTTP (no SSL) + REDIR=1 + simplified");
   Serial.println("==================================================\n");
 
   simSerial.begin(SIM800_BAUD, SERIAL_8N1, SIM800_RX_PIN, SIM800_TX_PIN);
