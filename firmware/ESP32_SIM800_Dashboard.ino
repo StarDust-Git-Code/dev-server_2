@@ -337,6 +337,9 @@ bool sendTelemetry(const LocationData& loc, const TowerData& cell) {
   safeDelay(300);
   sendAT("AT+SAPBR=3,1,\"Contype\",\"GPRS\"", 1000);
   sendAT("AT+SAPBR=3,1,\"APN\",\"" CELL_APN "\"", 1000);
+  // BSNL's own DNS — carrier blocks external DNS (8.8.8.8) on SAPBR PDP
+  sendAT("AT+SAPBR=3,1,\"DNS1\",\"218.248.240.10\"", 1000);
+  sendAT("AT+SAPBR=3,1,\"DNS2\",\"218.248.240.135\"", 1000);
   sendAT("AT+SAPBR=1,1", 10000);
   safeDelay(2000);
   String bearerSt = sendAT("AT+SAPBR=2,1", 2000);
@@ -423,7 +426,7 @@ void setup() {
   Serial.println(" ESP32-C3 + SIM800L CELLULAR TRIANGULATION TRACKER");
   Serial.println(" Network: BSNL 2G (PLMN 40464, APN: " CELL_APN ")");
   Serial.println(" Strategy: 100% FREE (LBS + Multi-Cell Scan)");
-  Serial.println(" v11: Plain HTTP (no SSL) + REDIR=1 + simplified");
+  Serial.println(" v12: BSNL DNS on SAPBR + plain HTTP + REDIR");
   Serial.println("==================================================\n");
 
   simSerial.begin(SIM800_BAUD, SERIAL_8N1, SIM800_RX_PIN, SIM800_TX_PIN);
