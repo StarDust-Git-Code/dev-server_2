@@ -14,12 +14,12 @@
 //  Endpoint: GET /external/api/batch/update?token=T&v1=X&v2=Y...
 // ══════════════════════════════════════════════════════════════
 
-#include <HardwareSerial.h>
-#include <esp_task_wdt.h>
+#include <Arduino.h>
+#include "esp_task_wdt.h"
 
 // ── Hardware ────────────────────────────────────────────────
-#define SIM800_RX_PIN     20
-#define SIM800_TX_PIN     21
+#define SIM800_TX_PIN     7
+#define SIM800_RX_PIN     6
 #define SIM800_BAUD       9600
 #define STATUS_LED        8
 
@@ -51,11 +51,7 @@ unsigned long fixCount = 0;
 // HELPERS
 // ══════════════════════════════════════════════════════════════
 void safeDelay(uint32_t ms) {
-  uint32_t start = millis();
-  while (millis() - start < ms) {
-    yield();
-    delayMicroseconds(100);
-  }
+  vTaskDelay(pdMS_TO_TICKS(ms));
 }
 
 String sendAT(String cmd, uint32_t timeoutMs) {
