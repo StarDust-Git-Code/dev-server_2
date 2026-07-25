@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 // ── Config ────────────────────────────────────────────────────
 const BLYNK_TOKEN       = process.env.BLYNK_TOKEN || '9fq9knGHB9Txb33Mlv4_O-JrMpOgjtkv';
 const BLYNK_HOST        = 'blr1.blynk.cloud';
-const OPENCELLID_KEY    = process.env.OPENCELLID_API_KEY || '';
+const OPENCELLID_KEY    = process.env.OPENCELLID_API_KEY || 'pk.69cdaed7edb06e2237aacbfb1426a440';
 const POLL_INTERVAL_MS  = 12000;  // Poll Blynk every 12 seconds
 const HISTORY_FILE      = path.join('/tmp', 'sim-track-history.json');
 const MAX_RECORDS       = 2000;
